@@ -1310,3 +1310,221 @@ class EmbeddingsSimilarityEnergy(EnergyTerm):
             global_index_list.append(chain_res_to_global[(str(chain_id), int(res_id))])
 
         return global_index_list
+
+
+class ipSAEEnergy(EnergyTerm):
+    """
+    Interface prediction Score from Aligned Errors (ipSAE).
+
+    Improved interface scoring metric computed from PAE matrices.  Works with
+    any FoldingOracle that returns ``pae`` (ESMFold *and* AlphaFast).
+
+    The ipSAE score captures the quality of a predicted protein-protein
+    interface.  Values > 0.6 suggest likely binding.
+
+    Implements the ``ipsae_d0res`` variant from the reference: for each
+    residue *i* in one chain, d0 is derived from the number of partner
+    residues in the other chain whose PAE is below ``pae_cutoff``.  The
+    per-residue score is the mean TM-score-like transform of those PAE
+    values.  The chain-pair score is the **max** per-residue value, taken
+    symmetrically across both directions.
+
+    Reference: Dunbrack Lab, "Res ipSAE loquunt" (2025).
+    See: https://github.com/DunbrackLab/IPSAE
+    """
+
+    def __init__(
+        self,
+        oracle: FoldingOracle,
+        residues: list[list[Residue]],
+        pae_cutoff: float = 10.0,
+        inheritable: bool = True,
+        weight: float = 1.0,
+        name: str | None = None,
+    ) -> None:
+        """
+        Initialises ipSAE Energy class.
+
+        Parameters
+        ----------
+        oracle : FoldingOracle
+            The oracle to use (must return ``pae``).
+        residues : list[list[Residue]]
+            Two groups of residues: group 0 (e.g. GEN chain) and group 1
+            (e.g. target chain).
+        pae_cutoff : float
+            PAE threshold (Angstroms) below which a residue pair is
+            considered part of the interface.
+        inheritable : bool
+            Whether the energy term is inheritable.
+        weight : float
+            The weight of the energy term.
+        name : str or None
+            Optional name suffix.
+        """
+        base_name = 'ipSAE'
+        if name is None:
+            name = base_name
+        else:
+            name = f'{base_name}_{name}'
+
+        super().__init__(name=name, inheritable=inheritable, oracle=oracle, weight=weight)
+        self.pae_cutoff = pae_cutoff
+
+        if len(residues) == 1:
+            self.residue_groups = [residue_list_to_group(residues[0]), residue_list_to_group(residues[0])]
+        else:
+            self.residue_groups = [residue_list_to_group(residues[0]), residue_list_to_group(residues[1])]
+
+        assert isinstance(self.oracle, FoldingOracle), 'Oracle must be an instance of FoldingOracle'
+        assert 'pae' in self.oracle.result_class.model_fields, (
+            'ipSAEEnergy requires oracle to return pae in result_class'
+        )
+
+    @staticmethod
+    def _calc_d0(L: float) -> float:
+        """
+        Calculate the distance normalisation factor d0 (Yang & Skolnick, 2004).
+
+        L is clamped to a minimum of 27, and d0 to a minimum of 1.0,
+        matching the reference implementation.
+        """
+        L = max(L, 27.0)
+        return max(1.24 * (L - 15.0) ** (1.0 / 3.0) - 1.8, 1.0)
+
+    @staticmethod
+    def _calc_d0_array(L: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Vectorised d0 calculation for arrays of L values."""
+        L = np.maximum(L, 27.0)
+        return np.maximum(1.24 * (L - 15.0) ** (1.0 / 3.0) - 1.8, 1.0)
+
+    def _ipsae_one_direction(
+        self,
+        pae: npt.NDArray[np.float64],
+        source_indices: npt.NDArray[np.int_],
+        target_indices: npt.NDArray[np.int_],
+    ) -> float:
+        """
+        Compute the asymmetric ipSAE score for source -> target direction.
+
+        For each residue *i* in source:
+          1. Find partners *j* in target where PAE[i, j] < pae_cutoff
+          2. n_i = count of such partners; d0_i = calc_d0(n_i)
+          3. score_i = mean of 1 / (1 + (PAE[i,j] / d0_i)^2) over those partners
+        Return max score_i across all source residues.
+        """
+        if len(source_indices) == 0 or len(target_indices) == 0:
+            return 0.0
+
+        # Extract the cross-chain PAE sub-matrix: [n_source, n_target]
+        pae_cross = pae[np.ix_(source_indices, target_indices)]
+
+        # For each source residue, find target partners below cutoff
+        valid_mask = pae_cross < self.pae_cutoff  # [n_source, n_target]
+
+        # Count valid partners per source residue
+        n_partners = valid_mask.sum(axis=1).astype(np.float64)  # [n_source]
+
+        # Residues with no valid partners get score 0
+        has_partners = n_partners > 0
+        if not np.any(has_partners):
+            return 0.0
+
+        # Compute per-residue d0 from partner count
+        d0_per_res = self._calc_d0_array(n_partners)  # [n_source]
+
+        # Compute per-residue ipSAE score
+        per_res_scores = np.zeros(len(source_indices), dtype=np.float64)
+        for i in range(len(source_indices)):
+            if not has_partners[i]:
+                continue
+            partner_pae = pae_cross[i, valid_mask[i]]  # PAE values below cutoff
+            ptm_scores = 1.0 / (1.0 + (partner_pae / d0_per_res[i]) ** 2)
+            per_res_scores[i] = ptm_scores.mean()
+
+        return float(np.max(per_res_scores))
+
+    def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
+        folding_result = oracles_result[self.oracle]
+        structure = oracles_result.get_structure(self.oracle)
+
+        assert hasattr(folding_result, 'pae'), 'pae metric not returned by folding algorithm'
+        assert folding_result.pae.shape[0] == 1, 'batch size equal to 1 is required'
+        pae = folding_result.pae[0]  # [n_residues, n_residues]
+
+        group_1_mask = self.get_residue_mask(structure, residue_group_index=0)
+        group_2_mask = self.get_residue_mask(structure, residue_group_index=1)
+
+        group_1_indices = np.where(group_1_mask)[0]
+        group_2_indices = np.where(group_2_mask)[0]
+
+        # Compute asymmetric ipSAE in both directions, take the max
+        score_1to2 = self._ipsae_one_direction(pae, group_1_indices, group_2_indices)
+        score_2to1 = self._ipsae_one_direction(pae, group_2_indices, group_1_indices)
+        ipsae = max(score_1to2, score_2to1)
+
+        # Negate: higher ipSAE = better binding -> lower energy
+        value = -ipsae
+        return value, value * self.weight
+
+
+class iPTMEnergy(EnergyTerm):
+    """
+    Interface pTM energy from AlphaFast's ``chain_pair_iptm`` matrix.
+
+    Requires an oracle whose result class contains a ``chain_pair_iptm``
+    field (i.e., AlphaFast).  The energy is the negative mean of
+    off-diagonal elements of the chain-pair iPTM matrix -- higher iPTM
+    means better predicted interface quality.
+    """
+
+    def __init__(
+        self,
+        oracle: FoldingOracle,
+        weight: float = 1.0,
+        name: str | None = None,
+    ) -> None:
+        """
+        Initialises iPTM Energy class.
+
+        Parameters
+        ----------
+        oracle : FoldingOracle
+            The oracle to use (must return ``chain_pair_iptm``).
+        weight : float
+            The weight of the energy term.
+        name : str or None
+            Optional name suffix.
+        """
+        if name is None:
+            name = 'iPTM'
+        else:
+            name = f'iPTM_{name}'
+
+        super().__init__(name=name, inheritable=False, oracle=oracle, weight=weight)
+        assert isinstance(self.oracle, FoldingOracle), 'Oracle must be an instance of FoldingOracle'
+        assert 'chain_pair_iptm' in self.oracle.result_class.model_fields, (
+            'iPTMEnergy requires oracle to return chain_pair_iptm in result_class '
+            '(use AlphaFast oracle)'
+        )
+
+    def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
+        folding_result = oracles_result[self.oracle]
+        assert hasattr(folding_result, 'chain_pair_iptm'), (
+            'chain_pair_iptm not returned by folding algorithm'
+        )
+        iptm_matrix = folding_result.chain_pair_iptm  # [n_chains, n_chains]
+        n_chains = iptm_matrix.shape[0]
+
+        if n_chains < 2:
+            # Single chain -- no interface to score
+            return 0.0, 0.0 * self.weight
+
+        # Extract off-diagonal elements (interface iPTM values)
+        off_diag_mask = ~np.eye(n_chains, dtype=bool)
+        off_diag_values = iptm_matrix[off_diag_mask]
+        mean_iptm = float(np.mean(off_diag_values))
+
+        # Negate: higher iPTM = better binding -> lower energy
+        value = -mean_iptm
+        return value, value * self.weight
