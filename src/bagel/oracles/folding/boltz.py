@@ -109,6 +109,9 @@ class Boltz(FoldingOracle):
         Number of recycling steps.  Passed as ``--recycling_steps`` if set.
     sampling_steps : int or None
         Number of diffusion sampling steps.  Passed as ``--sampling_steps``.
+    use_kernels : bool
+        Whether to use cuequivariance CUDA kernels.  Default: ``False``
+        (safe default; set to ``True`` if ``cuequivariance_torch`` is installed).
     boltz_command : str
         CLI command to invoke boltz.  Default: ``"boltz"``.
     extra_args : list[str]
@@ -125,6 +128,7 @@ class Boltz(FoldingOracle):
         model_seeds: list[int] | None = None,
         recycling_steps: int | None = None,
         sampling_steps: int | None = None,
+        use_kernels: bool = False,
         boltz_command: str = "boltz",
         extra_args: list[str] | None = None,
         msa_directory: str | None = None,
@@ -133,6 +137,7 @@ class Boltz(FoldingOracle):
         self.model_seeds = model_seeds or [1]
         self.recycling_steps = recycling_steps
         self.sampling_steps = sampling_steps
+        self.use_kernels = use_kernels
         self.boltz_command = boltz_command
         self.extra_args = extra_args or []
         self.msa_directory = msa_directory
@@ -409,6 +414,8 @@ class Boltz(FoldingOracle):
                 "--out_dir", str(out_dir),
                 "--write_full_pae",
             ]
+            if not self.use_kernels:
+                cmd.append("--no_kernels")
             if self.recycling_steps is not None:
                 cmd.extend(["--recycling_steps", str(self.recycling_steps)])
             if self.sampling_steps is not None:
