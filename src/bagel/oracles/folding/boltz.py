@@ -408,19 +408,35 @@ class Boltz(FoldingOracle):
             # Build command
             out_dir = tmpdir_path / "output"
             out_dir.mkdir()
-            cmd = [
-                self.boltz_command, "predict",
+
+            # PyTorch 2.6+ defaults torch.load to weights_only=True, which
+            # fails for Boltz checkpoints containing omegaconf.DictConfig.
+            # We invoke Boltz via a Python wrapper that patches torch.load
+            # with the needed safe globals before the CLI runs.
+            boltz_args = [
+                "predict",
                 str(yaml_path),
                 "--out_dir", str(out_dir),
                 "--write_full_pae",
             ]
             if not self.use_kernels:
-                cmd.append("--no_kernels")
+                boltz_args.append("--no_kernels")
             if self.recycling_steps is not None:
-                cmd.extend(["--recycling_steps", str(self.recycling_steps)])
+                boltz_args.extend(["--recycling_steps", str(self.recycling_steps)])
             if self.sampling_steps is not None:
-                cmd.extend(["--sampling_steps", str(self.sampling_steps)])
-            cmd.extend(self.extra_args)
+                boltz_args.extend(["--sampling_steps", str(self.sampling_steps)])
+            boltz_args.extend(self.extra_args)
+
+            wrapper_script = (
+                "import sys; "
+                "import torch; "
+                "from omegaconf import DictConfig, ListConfig; "
+                "torch.serialization.add_safe_globals([DictConfig, ListConfig]); "
+                "from boltz.main import cli; "
+                "sys.argv = ['boltz'] + sys.argv[1:]; "
+                "cli()"
+            )
+            cmd = ["python", "-c", wrapper_script] + boltz_args
 
             logger.info(f"Running Boltz: {' '.join(cmd)}")
             result = subprocess.run(
