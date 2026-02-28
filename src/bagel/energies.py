@@ -1528,3 +1528,112 @@ class iPTMEnergy(EnergyTerm):
         # Negate: higher iPTM = better binding -> lower energy
         value = -mean_iptm
         return value, value * self.weight
+
+
+class SolMPNNPerplexityEnergy(EnergyTerm):
+    """
+    SolubleMPNN sequence perplexity energy.
+
+    Evaluates how well the generated sequence matches its predicted backbone
+    structure, using SolubleMPNN's autoregressive log-likelihood.  This is a
+    proxy for designability / foldability.
+
+    Only the GEN chain residues are scored; the full complex (binder + target)
+    is passed so the MPNN encoder sees the binding context.
+
+    Runs on Modal in an isolated container (numpy 1.x, torch 2.2.1) to avoid
+    dependency conflicts with BAGEL/Boltz.  The Modal app must be deployed
+    first::
+
+        modal deploy modal_proteinmpnn_score.py
+    """
+
+    def __init__(
+        self,
+        oracle: FoldingOracle,
+        residues: list[Residue] | list[list[Residue]] | None = None,
+        weight: float = 1.0,
+        name: str | None = None,
+        modal_app_name: str = "proteinmpnn-scorer",
+        modal_function_name: str = "score_sequence",
+        num_batches: int = 10,
+    ) -> None:
+        """
+        Initialises SolMPNN Perplexity Energy.
+
+        Parameters
+        ----------
+        oracle : FoldingOracle
+            The folding oracle (provides the predicted structure).
+        residues : list[Residue] | list[list[Residue]] | None
+            Residues on the GEN chain to score.  When provided as a single
+            flat list or a list-of-lists with one group, defines the chain ID
+            used for MPNN scoring.  If ``None``, all residues are scored.
+        weight : float
+            The weight of the energy term.
+        name : str or None
+            Optional name suffix.
+        modal_app_name : str
+            Name of the deployed Modal app that hosts the MPNN scorer.
+        modal_function_name : str
+            Name of the Modal function to call.
+        num_batches : int
+            Number of random decoding orders to average over.
+        """
+        base_name = 'SolMPNN_perplexity'
+        if name is not None:
+            base_name = f'{base_name}_{name}'
+
+        super().__init__(
+            name=base_name, inheritable=False, oracle=oracle, weight=weight,
+        )
+
+        # Store residue groups (single group — the GEN chain to score).
+        if residues is not None:
+            if isinstance(residues, list) and residues and isinstance(residues[0], list):
+                self.residue_groups = [residue_list_to_group(residues[0])]
+            else:
+                self.residue_groups = [residue_list_to_group(residues)]
+
+        assert isinstance(self.oracle, FoldingOracle), (
+            'Oracle must be an instance of FoldingOracle'
+        )
+
+        self.modal_app_name = modal_app_name
+        self.modal_function_name = modal_function_name
+        self.num_batches = num_batches
+
+    def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
+        import io
+        from biotite.structure.io.pdb import PDBFile as BiotitePDBFile
+
+        structure = oracles_result.get_structure(self.oracle)
+
+        # Determine which chain to score from residue_groups[0]
+        if self.residue_groups:
+            chain_ids_group = self.residue_groups[0][0]
+            gen_chain_id = str(pd.unique(chain_ids_group)[0])
+        else:
+            gen_chain_id = str(pd.unique(structure.chain_id)[0])
+
+        # Convert AtomArray → PDB string via biotite
+        pdb_file = BiotitePDBFile()
+        pdb_file.set_structure(structure)
+        buf = io.StringIO()
+        pdb_file.write(buf)
+        pdb_str = buf.getvalue()
+
+        # Call the Modal function (runs in an isolated container)
+        import modal
+        score_fn = modal.Function.from_name(
+            self.modal_app_name, self.modal_function_name,
+        )
+        result = score_fn.remote(
+            pdb_str,
+            chains_to_score=gen_chain_id,
+            num_batches=self.num_batches,
+        )
+
+        perplexity = result["perplexity"]
+        # Higher perplexity = worse designability = higher energy (no negation)
+        return perplexity, perplexity * self.weight
