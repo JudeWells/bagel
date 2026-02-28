@@ -1604,7 +1604,9 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         self.num_batches = num_batches
 
     def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
+        import copy
         import io
+        import string
         from biotite.structure.io.pdb import PDBFile as BiotitePDBFile
 
         structure = oracles_result.get_structure(self.oracle)
@@ -1615,6 +1617,27 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             gen_chain_id = str(pd.unique(chain_ids_group)[0])
         else:
             gen_chain_id = str(pd.unique(structure.chain_id)[0])
+
+        # PDB format only supports single-character chain IDs.  Boltz and
+        # other predictors may produce multi-character IDs (e.g. "GEN").
+        # Remap all chain IDs to single uppercase letters for PDB export,
+        # and track which letter the GEN chain maps to.
+        unique_chains = list(pd.unique(structure.chain_id))
+        needs_remap = any(len(cid) > 1 for cid in unique_chains)
+
+        if needs_remap:
+            letters = list(string.ascii_uppercase)
+            chain_map = {}
+            for i, cid in enumerate(unique_chains):
+                chain_map[cid] = letters[i]
+            structure = copy.copy(structure)
+            structure.chain_id = np.array(
+                [chain_map[cid] for cid in structure.chain_id],
+                dtype=structure.chain_id.dtype,
+            )
+            pdb_gen_chain = chain_map[gen_chain_id]
+        else:
+            pdb_gen_chain = gen_chain_id
 
         # Convert AtomArray → PDB string via biotite
         pdb_file = BiotitePDBFile()
@@ -1630,7 +1653,7 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         )
         result = score_fn.remote(
             pdb_str,
-            chains_to_score=gen_chain_id,
+            chains_to_score=pdb_gen_chain,
             num_batches=self.num_batches,
         )
 
