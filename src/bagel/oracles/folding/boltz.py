@@ -430,7 +430,7 @@ class Boltz(FoldingOracle):
             wrapper_script = (
                 "import sys, torch; "
                 "_orig_load = torch.load; "
-                "torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': kw.get('weights_only', False)}); "
+                "torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False}); "
                 "from boltz.main import cli; "
                 "sys.argv = ['boltz'] + sys.argv[1:]; "
                 "cli()"
