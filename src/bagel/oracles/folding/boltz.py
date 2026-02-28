@@ -428,10 +428,9 @@ class Boltz(FoldingOracle):
             boltz_args.extend(self.extra_args)
 
             wrapper_script = (
-                "import sys; "
-                "import torch; "
-                "from omegaconf import DictConfig, ListConfig; "
-                "torch.serialization.add_safe_globals([DictConfig, ListConfig]); "
+                "import sys, torch; "
+                "_orig_load = torch.load; "
+                "torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': kw.get('weights_only', False)}); "
                 "from boltz.main import cli; "
                 "sys.argv = ['boltz'] + sys.argv[1:]; "
                 "cli()"
