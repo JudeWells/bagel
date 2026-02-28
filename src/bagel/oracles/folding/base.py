@@ -72,6 +72,16 @@ class FoldingOracle(Oracle):
         """
         return self.fold(chains=chains)
 
+    def predict_batch(self, chains_list: list[list[Chain]]) -> list[FoldingResult]:
+        """
+        Predict structures for multiple chain-lists.
+
+        The default implementation calls :meth:`predict` sequentially.
+        Subclasses (e.g. Boltz) can override this to batch predictions
+        in a single process invocation, avoiding repeated model loading.
+        """
+        return [self.predict(chains) for chains in chains_list]
+
     @abstractmethod
     def fold(self, chains: list[Chain]) -> FoldingResult:
         raise NotImplementedError('This method should be implemented by the folding algorithm')

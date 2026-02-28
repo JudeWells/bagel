@@ -250,17 +250,34 @@ class Boltz(FoldingOracle):
     # Output parsing
     # --------------------------------------------------------------------- #
 
-    def _find_output_files(self, out_dir: Path) -> dict[str, Path]:
+    @staticmethod
+    def _find_output_files(out_dir: Path, job_id: str | None = None) -> dict[str, Path]:
         """
         Locate Boltz output files in the output directory.
 
-        Boltz writes to: ``{out_dir}/boltz_results_{hash}/predictions/{hash}/``
-        with files like ``{hash}_model_0.cif``, ``pae_{hash}_model_0.npz``, etc.
+        Boltz writes to: ``{out_dir}/boltz_results_{stem}/predictions/{job_id}/``
+        with files like ``{job_id}_model_0.cif``, ``pae_{job_id}_model_0.npz``, etc.
+
+        Parameters
+        ----------
+        out_dir : Path
+            Root output directory passed to ``boltz predict --out_dir``.
+        job_id : str or None
+            When set, restrict the search to the specific job subdirectory
+            under ``predictions/{job_id}/``.  When *None*, search the entire
+            output tree (legacy single-file mode).
         """
+        if job_id is not None:
+            # In batch mode, outputs live under predictions/{job_id}/
+            pred_dirs = list(out_dir.rglob(f"predictions/{job_id}"))
+            search_root = pred_dirs[0] if pred_dirs else out_dir
+        else:
+            search_root = out_dir
+
         files: dict[str, Path] = {}
 
         # Find CIF file
-        cif_files = list(out_dir.rglob("*_model_*.cif"))
+        cif_files = list(search_root.rglob("*_model_*.cif"))
         # Exclude pae/plddt/confidence prefixed files
         cif_files = [f for f in cif_files if not any(
             f.name.startswith(p) for p in ("pae_", "plddt_", "confidence_")
@@ -269,17 +286,17 @@ class Boltz(FoldingOracle):
             files["cif"] = cif_files[0]
 
         # Find PAE NPZ
-        pae_files = list(out_dir.rglob("pae_*_model_*.npz"))
+        pae_files = list(search_root.rglob("pae_*_model_*.npz"))
         if pae_files:
             files["pae"] = pae_files[0]
 
         # Find pLDDT NPZ
-        plddt_files = list(out_dir.rglob("plddt_*_model_*.npz"))
+        plddt_files = list(search_root.rglob("plddt_*_model_*.npz"))
         if plddt_files:
             files["plddt"] = plddt_files[0]
 
         # Find confidence JSON
-        conf_files = list(out_dir.rglob("confidence_*_model_*.json"))
+        conf_files = list(search_root.rglob("confidence_*_model_*.json"))
         if conf_files:
             files["confidence"] = conf_files[0]
 
@@ -391,6 +408,62 @@ class Boltz(FoldingOracle):
     # Main fold method
     # --------------------------------------------------------------------- #
 
+    # --------------------------------------------------------------------- #
+    # Boltz subprocess helpers
+    # --------------------------------------------------------------------- #
+
+    def _build_boltz_args(self, data_path: str, out_dir: str) -> list[str]:
+        """Build the CLI arguments for ``boltz predict``."""
+        boltz_args = [
+            "predict",
+            data_path,
+            "--out_dir", out_dir,
+            "--write_full_pae",
+        ]
+        if not self.use_kernels:
+            boltz_args.append("--no_kernels")
+        if self.recycling_steps is not None:
+            boltz_args.extend(["--recycling_steps", str(self.recycling_steps)])
+        if self.sampling_steps is not None:
+            boltz_args.extend(["--sampling_steps", str(self.sampling_steps)])
+        boltz_args.extend(self.extra_args)
+        return boltz_args
+
+    def _run_boltz_subprocess(self, boltz_args: list[str], timeout: int = 1800) -> None:
+        """
+        Run ``boltz predict`` via a Python wrapper that patches ``torch.load``
+        for PyTorch 2.6+ compatibility (weights_only default change).
+        """
+        wrapper_script = (
+            "import sys, torch; "
+            "_orig_load = torch.load; "
+            "torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False}); "
+            "from boltz.main import cli; "
+            "sys.argv = ['boltz'] + sys.argv[1:]; "
+            "cli()"
+        )
+        cmd = ["python", "-c", wrapper_script] + boltz_args
+
+        logger.info(f"Running Boltz: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            logger.error(f"Boltz stderr:\n{result.stderr}")
+            raise RuntimeError(
+                f"Boltz predict failed (exit code {result.returncode}):\n"
+                f"{result.stderr[-2000:]}"
+            )
+        if result.stdout:
+            logger.debug(f"Boltz stdout:\n{result.stdout[-1000:]}")
+
+    # --------------------------------------------------------------------- #
+    # Single fold
+    # --------------------------------------------------------------------- #
+
     def fold(self, chains: list[Chain]) -> BoltzResult:
         """
         Fold chains using Boltz via local CLI.
@@ -405,53 +478,11 @@ class Boltz(FoldingOracle):
             yaml_path = tmpdir_path / "input.yaml"
             self._chains_to_boltz_yaml(chains, yaml_path)
 
-            # Build command
             out_dir = tmpdir_path / "output"
             out_dir.mkdir()
 
-            # PyTorch 2.6+ defaults torch.load to weights_only=True, which
-            # fails for Boltz checkpoints containing omegaconf.DictConfig.
-            # We invoke Boltz via a Python wrapper that patches torch.load
-            # with the needed safe globals before the CLI runs.
-            boltz_args = [
-                "predict",
-                str(yaml_path),
-                "--out_dir", str(out_dir),
-                "--write_full_pae",
-            ]
-            if not self.use_kernels:
-                boltz_args.append("--no_kernels")
-            if self.recycling_steps is not None:
-                boltz_args.extend(["--recycling_steps", str(self.recycling_steps)])
-            if self.sampling_steps is not None:
-                boltz_args.extend(["--sampling_steps", str(self.sampling_steps)])
-            boltz_args.extend(self.extra_args)
-
-            wrapper_script = (
-                "import sys, torch; "
-                "_orig_load = torch.load; "
-                "torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False}); "
-                "from boltz.main import cli; "
-                "sys.argv = ['boltz'] + sys.argv[1:]; "
-                "cli()"
-            )
-            cmd = ["python", "-c", wrapper_script] + boltz_args
-
-            logger.info(f"Running Boltz: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=1800,  # 30 min timeout
-            )
-            if result.returncode != 0:
-                logger.error(f"Boltz stderr:\n{result.stderr}")
-                raise RuntimeError(
-                    f"Boltz predict failed (exit code {result.returncode}):\n"
-                    f"{result.stderr[-2000:]}"
-                )
-            if result.stdout:
-                logger.debug(f"Boltz stdout:\n{result.stdout[-1000:]}")
+            boltz_args = self._build_boltz_args(str(yaml_path), str(out_dir))
+            self._run_boltz_subprocess(boltz_args)
 
             # Find and parse output files
             output_files = self._find_output_files(out_dir)
@@ -462,3 +493,75 @@ class Boltz(FoldingOracle):
                 )
 
             return self._parse_output(output_files, chains)
+
+    # --------------------------------------------------------------------- #
+    # Batch fold — single Boltz invocation for multiple jobs
+    # --------------------------------------------------------------------- #
+
+    def fold_batch(self, chains_list: list[list[Chain]]) -> list[BoltzResult]:
+        """
+        Fold multiple chain-lists in a single Boltz invocation.
+
+        Writes one YAML file per job to a temporary directory and runs
+        ``boltz predict <directory>`` once.  The model is loaded once and
+        reused for all jobs, saving ~30 s of model-loading overhead per
+        additional job.
+
+        Parameters
+        ----------
+        chains_list : list[list[Chain]]
+            Each element is the list of chains for one prediction job
+            (e.g. ``[gen_chain, target_chain]``).
+
+        Returns
+        -------
+        list[BoltzResult]
+            One result per input job, in the same order.
+        """
+        if len(chains_list) == 1:
+            return [self.fold(chains_list[0])]
+
+        with tempfile.TemporaryDirectory(prefix="boltz_batch_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            # Write one YAML per job into an input directory.
+            # Boltz uses the filename stem as the job ID.
+            input_dir = tmpdir_path / "inputs"
+            input_dir.mkdir()
+            job_ids: list[str] = []
+            for idx, chains in enumerate(chains_list):
+                job_id = f"candidate_{idx:04d}"
+                job_ids.append(job_id)
+                yaml_path = input_dir / f"{job_id}.yaml"
+                self._chains_to_boltz_yaml(chains, yaml_path)
+
+            out_dir = tmpdir_path / "output"
+            out_dir.mkdir()
+
+            # Single Boltz invocation with the directory of YAMLs.
+            # Increase timeout proportionally to batch size.
+            timeout = max(1800, 600 * len(chains_list))
+            boltz_args = self._build_boltz_args(str(input_dir), str(out_dir))
+            self._run_boltz_subprocess(boltz_args, timeout=timeout)
+
+            # Parse each job's output.
+            results: list[BoltzResult] = []
+            for job_id, chains in zip(job_ids, chains_list):
+                output_files = self._find_output_files(out_dir, job_id=job_id)
+                if "cif" not in output_files:
+                    raise FileNotFoundError(
+                        f"No CIF output found for job {job_id!r} in {out_dir}. "
+                        f"Boltz may have failed on this input."
+                    )
+                results.append(self._parse_output(output_files, chains))
+
+            return results
+
+    def predict_batch(self, chains_list: list[list[Chain]]) -> list[BoltzResult]:
+        """
+        Predict structures for multiple chain-lists in a single Boltz run.
+
+        Overrides the sequential default in :class:`FoldingOracle` to use
+        directory-based batching, loading the model only once.
+        """
+        return self.fold_batch(chains_list)
