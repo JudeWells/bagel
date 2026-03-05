@@ -143,6 +143,8 @@ class AlphaFast(FoldingOracle):
             "name": "bagel_prediction",
             "modelSeeds": model_seeds,
             "sequences": sequences,
+            "dialect": "alphafold3",
+            "version": 1,
         }
 
     # --------------------------------------------------------------------- #
@@ -277,6 +279,11 @@ class AlphaFast(FoldingOracle):
             import modal
             fn = modal.Function.from_name(self.modal_app_name, self.modal_function_name)
             result = fn.remote(af3_input, **self.config)
+            # Check for error status from the Modal function
+            if isinstance(result, dict) and result.get("status") == "error":
+                raise RuntimeError(
+                    f"AlphaFast Modal function returned error: {result.get('error', 'unknown')}"
+                )
             return result
         except Exception as e:
             logger.warning(
