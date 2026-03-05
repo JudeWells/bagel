@@ -167,8 +167,15 @@ class AlphaFast(FoldingOracle):
         (matching ESMFold convention).  Falls back to mean over atoms in each
         residue if CA is missing.
         """
-        import pandas as pd
-        unique_res = pd.unique(list(zip(structure.chain_id, structure.res_id)))
+        # Build unique (chain_id, res_id) pairs preserving order
+        seen: set[tuple[str, int]] = set()
+        unique_res: list[tuple[str, int]] = []
+        for cid, rid in zip(structure.chain_id, structure.res_id):
+            key = (str(cid), int(rid))
+            if key not in seen:
+                seen.add(key)
+                unique_res.append(key)
+
         per_res = []
         for chain_id, res_id in unique_res:
             mask = (structure.chain_id == chain_id) & (structure.res_id == res_id)
