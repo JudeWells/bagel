@@ -208,20 +208,34 @@ class AlphaFast(FoldingOracle):
         summary = output.get("summary_confidences", {}) or output.get("summary", {})
         full_data = output.get("full_data", {}) or output.get("confidence", {})
 
-        # pTM
-        ptm_val = float(summary.get("ptm", 0.0))
+        # AF3 Modal output stores per-atom pLDDT and PAE in per-sample files
+        # (e.g. "seed-1_sample-0/..._confidences.json") rather than in the
+        # top-level confidence dict.  Extract from the best sample (sample-0).
+        if not full_data.get("atom_plddts") and not full_data.get("pae"):
+            files = output.get("files", {})
+            for fname, fdata in files.items():
+                if "confidences.json" in fname and "summary" not in fname and "sample-0" in fname:
+                    if isinstance(fdata, dict):
+                        full_data = fdata
+                    break
+
+        # The confidence dict from Modal contains summary-level metrics too
+        conf = output.get("confidence", {})
+
+        # pTM — check summary first, then confidence dict
+        ptm_val = float(summary.get("ptm", 0.0) or conf.get("ptm", 0.0))
         ptm = np.array([ptm_val], dtype=np.float64)
 
         # Ranking score
-        ranking_score = float(summary.get("ranking_score", 0.0))
+        ranking_score = float(summary.get("ranking_score", 0.0) or conf.get("ranking_score", 0.0))
 
         # chain_pair_iptm: [n_chains, n_chains]
-        chain_pair_iptm_raw = summary.get("chain_pair_iptm", None)
+        chain_pair_iptm_raw = summary.get("chain_pair_iptm", None) or conf.get("chain_pair_iptm", None)
         if chain_pair_iptm_raw is not None:
             chain_pair_iptm = np.array(chain_pair_iptm_raw, dtype=np.float64)
         else:
             # Fallback: use scalar iptm on off-diagonal
-            iptm_val = float(summary.get("iptm", 0.0))
+            iptm_val = float(summary.get("iptm", 0.0) or conf.get("iptm", 0.0))
             n_chains = len(chains)
             chain_pair_iptm = np.eye(n_chains, dtype=np.float64)
             for i in range(n_chains):
