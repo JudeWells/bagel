@@ -101,7 +101,7 @@ class AlphaFast(FoldingOracle):
     def __init__(
         self,
         model_seeds: list[int] | None = None,
-        modal_app_name: str = "alphafast-predict",
+        modal_app_name: str = "alphafold3-inference",
         modal_function_name: str = "predict_structure",
         config: dict[str, Any] | None = None,
     ) -> None:
@@ -194,15 +194,17 @@ class AlphaFast(FoldingOracle):
         If the Modal function returns raw file paths instead, this method
         handles that case too.
         """
-        # Parse structure
-        cif_content = output.get("cif", "")
+        # Parse structure — handle both key conventions:
+        # Modal predict_structure returns "structure", BAGEL convention uses "cif"
+        cif_content = output.get("cif", "") or output.get("structure", "")
         if not cif_content:
-            raise ValueError("AlphaFast output missing 'cif' key")
+            raise ValueError("AlphaFast output missing 'cif'/'structure' key")
         structure = self._parse_cif(cif_content)
 
-        # Parse confidence metrics
-        summary = output.get("summary_confidences", {})
-        full_data = output.get("full_data", {})
+        # Parse confidence metrics — handle both key conventions:
+        # Modal returns "summary" + "confidence", BAGEL uses "summary_confidences" + "full_data"
+        summary = output.get("summary_confidences", {}) or output.get("summary", {})
+        full_data = output.get("full_data", {}) or output.get("confidence", {})
 
         # pTM
         ptm_val = float(summary.get("ptm", 0.0))
@@ -226,7 +228,8 @@ class AlphaFast(FoldingOracle):
                         chain_pair_iptm[i, j] = iptm_val
 
         # Per-atom pLDDT → per-residue, normalise from 0-100 to 0-1
-        atom_plddts = summary.get("atom_plddts", None)
+        # atom_plddts may be in summary (BAGEL convention) or full_data/confidence (AF3 convention)
+        atom_plddts = summary.get("atom_plddts", None) or full_data.get("atom_plddts", None)
         if atom_plddts is not None:
             atom_plddt_arr = np.array(atom_plddts, dtype=np.float64)
             # AF3 pLDDT is on 0-100 scale; normalise to 0-1
