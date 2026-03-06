@@ -298,21 +298,30 @@ class AlphaFast(FoldingOracle):
         """
         try:
             import modal
+        except ImportError:
+            logger.warning("modal not installed; falling back to subprocess")
+            return self._call_modal_subprocess(af3_input)
+
+        try:
             fn = modal.Function.from_name(self.modal_app_name, self.modal_function_name)
             result = fn.remote(af3_input, **self.config)
             # Check for error status from the Modal function
             if isinstance(result, dict) and result.get("status") == "error":
+                error_msg = result.get("error", "unknown")
                 raise RuntimeError(
-                    f"AlphaFast Modal function returned error: {result.get('error', 'unknown')}"
+                    f"AlphaFast Modal function returned error: {error_msg}"
                 )
             return result
-        except Exception as e:
+        except modal.exception.NotFoundError as e:
             logger.warning(
                 f"modal.Function.from_name failed ({e}); "
                 f"falling back to subprocess 'modal run'"
             )
 
-        # Fallback: write input JSON to temp file and call via subprocess
+        return self._call_modal_subprocess(af3_input)
+
+    def _call_modal_subprocess(self, af3_input: dict[str, Any]) -> dict[str, Any]:
+        """Fallback: write input JSON to temp file and call via subprocess."""
         with tempfile.NamedTemporaryFile(
             suffix=".json", mode="w", delete=False, prefix="af3_input_"
         ) as f:
