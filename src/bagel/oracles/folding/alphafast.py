@@ -215,6 +215,35 @@ class AlphaFast(FoldingOracle):
             raise ValueError("AlphaFast output missing 'cif'/'structure' key")
         structure = self._parse_cif(cif_content)
 
+        # Remap chain IDs: AF3 assigns its own chain IDs (A, B, C, ...) which
+        # may not match the input BAGEL chain IDs (e.g. "GEN", "B").  Match
+        # output chains to input chains by sequence length, then rename.
+        output_chain_ids = list(dict.fromkeys(structure.chain_id))  # unique, order-preserving
+        input_chain_ids = [c.chain_ID for c in chains]
+        if set(output_chain_ids) != set(input_chain_ids):
+            # Build mapping: output_chain_id -> input_chain_id by matching lengths
+            out_lengths = {}
+            for oc in output_chain_ids:
+                out_lengths[oc] = int(np.sum(structure.atom_name[structure.chain_id == oc] == "CA"))
+            in_lengths = {c.chain_ID: len(c.sequence) for c in chains}
+            chain_map: dict[str, str] = {}
+            used_input: set[str] = set()
+            for oc, olen in out_lengths.items():
+                for ic, ilen in in_lengths.items():
+                    if ic not in used_input and olen == ilen:
+                        chain_map[oc] = ic
+                        used_input.add(ic)
+                        break
+            if len(chain_map) == len(output_chain_ids):
+                new_chain_ids = np.array([chain_map.get(c, c) for c in structure.chain_id])
+                structure.chain_id = new_chain_ids
+                logger.info(f"Remapped AF3 chain IDs: {chain_map}")
+            else:
+                logger.warning(
+                    f"Could not remap all chain IDs (output={output_chain_ids}, "
+                    f"input={input_chain_ids}); ipSAE may be incorrect"
+                )
+
         # Parse confidence metrics — handle both key conventions:
         # Modal returns "summary" + "confidence", BAGEL uses "summary_confidences" + "full_data"
         summary = output.get("summary_confidences", {}) or output.get("summary", {})
