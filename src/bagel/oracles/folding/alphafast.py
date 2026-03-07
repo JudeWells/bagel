@@ -104,41 +104,46 @@ class AlphaFast(FoldingOracle):
         modal_app_name: str = "alphafold3-inference",
         modal_function_name: str = "predict_structure",
         config: dict[str, Any] | None = None,
+        skip_msa: bool = True,
     ) -> None:
         self.model_seeds = model_seeds or [1]
         self.modal_app_name = modal_app_name
         self.modal_function_name = modal_function_name
-        self.config = config or {}
+        self.skip_msa = skip_msa
+        config = config or {}
+        if self.skip_msa:
+            config.setdefault("run_msa", False)
+        self.config = config
 
     # --------------------------------------------------------------------- #
     # AF3 JSON input format
     # --------------------------------------------------------------------- #
 
     @staticmethod
-    def _chains_to_af3_json(chains: list[Chain], model_seeds: list[int]) -> dict:
+    def _chains_to_af3_json(
+        chains: list[Chain],
+        model_seeds: list[int],
+        skip_msa: bool = False,
+    ) -> dict:
         """
-        Convert BAGEL Chain objects to the AF3 JSON input format expected by
-        AlphaFast.
+        Convert BAGEL Chain objects to the AF3 JSON input format.
 
-        Format::
-
-            {
-              "name": "prediction",
-              "modelSeeds": [1],
-              "sequences": [
-                {"protein": {"id": ["A"], "sequence": "MKLL..."}},
-                {"protein": {"id": ["B"], "sequence": "GFED..."}}
-              ]
-            }
+        When *skip_msa* is ``True``, each protein entry includes inline dummy
+        ``unpairedMsa`` / ``pairedMsa`` fields (query-only) and empty
+        ``templates`` so that the AF3 data pipeline can be skipped entirely.
         """
         sequences = []
         for chain in chains:
-            sequences.append({
-                "protein": {
-                    "id": [chain.chain_ID],
-                    "sequence": chain.sequence,
-                }
-            })
+            protein: dict = {
+                "id": [chain.chain_ID],
+                "sequence": chain.sequence,
+            }
+            if skip_msa:
+                dummy_msa = f">query\n{chain.sequence}\n"
+                protein["unpairedMsa"] = dummy_msa
+                protein["pairedMsa"] = dummy_msa
+                protein["templates"] = []
+            sequences.append({"protein": protein})
         return {
             "name": "bagel_prediction",
             "modelSeeds": model_seeds,
@@ -376,7 +381,7 @@ class AlphaFast(FoldingOracle):
         When multiple ``model_seeds`` are configured, runs all seeds and
         returns the result with the best ``ranking_score``.
         """
-        af3_input = self._chains_to_af3_json(chains, self.model_seeds)
+        af3_input = self._chains_to_af3_json(chains, self.model_seeds, skip_msa=self.skip_msa)
 
         logger.info(
             f"Calling AlphaFast via Modal with {len(chains)} chain(s), "
