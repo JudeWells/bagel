@@ -1709,7 +1709,13 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             chain_map = {}
             for i, cid in enumerate(unique_chains):
                 chain_map[cid] = letters[i]
-            structure = _copy.copy(structure)
+            # Use structure.copy() — biotite's deep copy.  copy.copy() is a
+            # shallow copy that shares the underlying chain_id numpy array,
+            # so reassigning .chain_id also mutates the ORIGINAL structure
+            # stored in the BoltzResult, corrupting chain IDs seen by later
+            # energy terms (e.g. HydrophobicEnergy.get_atom_mask returns an
+            # empty GEN mask → ZeroDivisionError).
+            structure = structure.copy()
             structure.chain_id = np.array(
                 [chain_map[cid] for cid in structure.chain_id],
                 dtype=structure.chain_id.dtype,
