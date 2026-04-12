@@ -109,6 +109,13 @@ class Boltz(FoldingOracle):
         Number of recycling steps.  Passed as ``--recycling_steps`` if set.
     sampling_steps : int or None
         Number of diffusion sampling steps.  Passed as ``--sampling_steps``.
+    diffusion_samples : int
+        Number of independent diffusion samples to generate in a single
+        ``boltz predict`` call via ``--diffusion_samples``.  When > 1, the
+        oracle averages the scalar metrics (pTM, chain_pair_iptm) and tensor
+        metrics (pLDDT, PAE) across samples and returns a single
+        :class:`BoltzResult` whose ``structure`` comes from sample 0.
+        Default: 1.
     use_kernels : bool
         Whether to use cuequivariance CUDA kernels.  Default: ``False``
         (safe default; set to ``True`` if ``cuequivariance_torch`` is installed).
@@ -128,15 +135,19 @@ class Boltz(FoldingOracle):
         model_seeds: list[int] | None = None,
         recycling_steps: int | None = None,
         sampling_steps: int | None = None,
+        diffusion_samples: int = 1,
         use_kernels: bool = False,
         boltz_command: str = "boltz",
         extra_args: list[str] | None = None,
         msa_directory: str | None = None,
         config: dict[str, Any] | None = None,
     ) -> None:
+        if diffusion_samples < 1:
+            raise ValueError(f"diffusion_samples must be >= 1, got {diffusion_samples}")
         self.model_seeds = model_seeds or [1]
         self.recycling_steps = recycling_steps
         self.sampling_steps = sampling_steps
+        self.diffusion_samples = diffusion_samples
         self.use_kernels = use_kernels
         self.boltz_command = boltz_command
         self.extra_args = extra_args or []
@@ -426,6 +437,8 @@ class Boltz(FoldingOracle):
             boltz_args.extend(["--recycling_steps", str(self.recycling_steps)])
         if self.sampling_steps is not None:
             boltz_args.extend(["--sampling_steps", str(self.sampling_steps)])
+        if self.diffusion_samples > 1:
+            boltz_args.extend(["--diffusion_samples", str(self.diffusion_samples)])
         boltz_args.extend(self.extra_args)
         return boltz_args
 
@@ -449,6 +462,8 @@ class Boltz(FoldingOracle):
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         if result.returncode != 0:
@@ -464,17 +479,62 @@ class Boltz(FoldingOracle):
     # Single fold
     # --------------------------------------------------------------------- #
 
+    def _find_sample_files(
+        self,
+        out_dir: Path,
+        sample_idx: int,
+        job_id: str | None = None,
+    ) -> dict[str, Path]:
+        """Locate Boltz output files for a specific diffusion sample index.
+
+        When ``--diffusion_samples N > 1``, Boltz writes N sets of output files
+        named like ``{job_id}_model_0.cif``, ``{job_id}_model_1.cif``, etc.
+        This helper returns the file dict for one specific sample.
+        """
+        if job_id is not None:
+            pred_dirs = list(out_dir.rglob(f"predictions/{job_id}"))
+            search_root = pred_dirs[0] if pred_dirs else out_dir
+        else:
+            search_root = out_dir
+
+        files: dict[str, Path] = {}
+        suffix = f"_model_{sample_idx}"
+
+        cif_files = [
+            f for f in search_root.rglob(f"*{suffix}.cif")
+            if not any(f.name.startswith(p) for p in ("pae_", "plddt_", "confidence_"))
+        ]
+        if cif_files:
+            files["cif"] = cif_files[0]
+
+        pae_files = list(search_root.rglob(f"pae_*{suffix}.npz"))
+        if pae_files:
+            files["pae"] = pae_files[0]
+
+        plddt_files = list(search_root.rglob(f"plddt_*{suffix}.npz"))
+        if plddt_files:
+            files["plddt"] = plddt_files[0]
+
+        conf_files = list(search_root.rglob(f"confidence_*{suffix}.json"))
+        if conf_files:
+            files["confidence"] = conf_files[0]
+
+        return files
+
     def fold(self, chains: list[Chain]) -> BoltzResult:
         """
         Fold chains using Boltz via local CLI.
 
         Creates a temporary YAML input, runs ``boltz predict``, parses the
         output, and returns a BoltzResult.
+
+        When ``diffusion_samples > 1``, all N samples are parsed and their
+        metrics (pLDDT, PAE, pTM, chain_pair_iptm) are averaged into a single
+        :class:`BoltzResult`.  The returned structure is taken from sample 0.
         """
         with tempfile.TemporaryDirectory(prefix="boltz_") as tmpdir:
             tmpdir_path = Path(tmpdir)
 
-            # Write Boltz input YAML
             yaml_path = tmpdir_path / "input.yaml"
             self._chains_to_boltz_yaml(chains, yaml_path)
 
@@ -484,15 +544,62 @@ class Boltz(FoldingOracle):
             boltz_args = self._build_boltz_args(str(yaml_path), str(out_dir))
             self._run_boltz_subprocess(boltz_args)
 
-            # Find and parse output files
-            output_files = self._find_output_files(out_dir)
-            if "cif" not in output_files:
+            # Single-sample (legacy fast path)
+            if self.diffusion_samples <= 1:
+                output_files = self._find_output_files(out_dir)
+                if "cif" not in output_files:
+                    raise FileNotFoundError(
+                        f"No CIF output found in {out_dir}. "
+                        f"Boltz may have failed silently. Check stderr above."
+                    )
+                return self._parse_output(output_files, chains)
+
+            # Multi-sample: parse all N samples and average the metrics
+            results: list[BoltzResult] = []
+            for sample_idx in range(self.diffusion_samples):
+                sample_files = self._find_sample_files(out_dir, sample_idx)
+                if "cif" not in sample_files:
+                    logger.warning(
+                        f"Boltz diffusion sample {sample_idx} has no CIF output; skipping."
+                    )
+                    continue
+                try:
+                    results.append(self._parse_output(sample_files, chains))
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to parse Boltz sample {sample_idx}: {exc}"
+                    )
+
+            if not results:
                 raise FileNotFoundError(
-                    f"No CIF output found in {out_dir}. "
-                    f"Boltz may have failed silently. Check stderr above."
+                    f"No Boltz diffusion samples could be parsed from {out_dir}."
                 )
 
-            return self._parse_output(output_files, chains)
+            if len(results) == 1:
+                return results[0]
+
+            # Average the metrics across samples.  Structure comes from sample 0.
+            avg_plddt = np.mean(
+                np.stack([r.local_plddt for r in results], axis=0), axis=0
+            )
+            avg_pae = np.mean(
+                np.stack([r.pae for r in results], axis=0), axis=0
+            )
+            avg_ptm = np.mean(
+                np.stack([r.ptm for r in results], axis=0), axis=0
+            )
+            avg_chain_pair_iptm = np.mean(
+                np.stack([r.chain_pair_iptm for r in results], axis=0), axis=0
+            )
+
+            return BoltzResult(
+                input_chains=chains,
+                structure=results[0].structure,
+                local_plddt=avg_plddt,
+                pae=avg_pae,
+                ptm=avg_ptm,
+                chain_pair_iptm=avg_chain_pair_iptm,
+            )
 
     # --------------------------------------------------------------------- #
     # Batch fold — single Boltz invocation for multiple jobs

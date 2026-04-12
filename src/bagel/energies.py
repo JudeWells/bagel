@@ -1536,16 +1536,51 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
 
     Evaluates how well the generated sequence matches its predicted backbone
     structure, using SolubleMPNN's autoregressive log-likelihood.  This is a
-    proxy for designability / foldability.
+    proxy for designability / foldability (lower perplexity = better).
 
-    Only the GEN chain residues are scored; the full complex (binder + target)
-    is passed so the MPNN encoder sees the binding context.
+    The energy is oracle-agnostic: it pulls the predicted structure from any
+    :class:`FoldingOracle` (ESMFold, Boltz, Chai-1, AF2BindCraft, …) and
+    serialises it to PDB for scoring.  Only residues on the scored chain
+    contribute to the loss; the **full complex** (binder + target) is
+    passed to the MPNN encoder so it sees the binding context.
 
-    Runs on Modal in an isolated container (numpy 1.x, torch 2.2.1) to avoid
-    dependency conflicts with BAGEL/Boltz.  The Modal app must be deployed
-    first::
+    Complex-context scoring is strongly recommended for binder design.
+    On the 1YCR heterodimer (p53 peptide bound to MDM2), scoring the
+    p53 peptide in isolation gives perplexity 16.57 ± 0.19, while scoring
+    it in the MDM2 complex gives 4.47 ± 0.07 (10 repeats of 10 ensemble
+    passes each, backbone_noise=0.1; Welch t ≈ -188).  Monomer-only
+    scoring would penalise legitimate interface sequences.  See
+    ``test_mpnn_context_significance.py`` in the profam_bagel repo.
 
-        modal deploy modal_proteinmpnn_score.py
+    **Backends** (select via ``use_modal``):
+
+    * ``use_modal=True``  — legacy Modal backend.  Requires a deployed
+      Modal app::
+
+          modal deploy modal_proteinmpnn_score.py
+
+    * ``use_modal=False`` (default) — runs locally by invoking the
+      bundled :mod:`bagel.scripts.proteinmpnn_scorer` script inside a
+      separate conda env (isolating ProteinMPNN's older dependency pins
+      from the main BAGEL/Boltz/Chai1 stack).  Requires:
+
+      - A clone of https://github.com/dauparas/ProteinMPNN.
+      - A conda env (e.g. ``proteinmpnn``) with torch + numpy that can
+        import the cloned repo.
+      - ``proteinmpnn_path`` pointing at the clone.
+      - ``proteinmpnn_env`` set to the conda env name (default
+        ``proteinmpnn``).
+
+    **Hyperparameters (local mode):**
+
+    * ``backbone_noise`` — Gaussian std applied to backbone coordinates
+      during featurisation (``augment_eps`` in ProteinMPNN).  Each
+      ensemble pass draws an independent noise realisation.
+    * ``ensemble_n`` — Number of forward passes.  Each uses an
+      independent decoding order AND an independent backbone-noise draw;
+      the returned perplexity is ``exp(mean NLL)`` across passes.
+    * ``decoding_order`` — ``"random"`` (default; fresh randn per pass)
+      or ``"fixed:<seed>"`` for deterministic ordering.
     """
 
     def __init__(
@@ -1554,9 +1589,18 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         residues: list[Residue] | list[list[Residue]] | None = None,
         weight: float = 1.0,
         name: str | None = None,
+        # Modal backend (legacy)
+        use_modal: bool = False,
         modal_app_name: str = "proteinmpnn-scorer",
         modal_function_name: str = "score_sequence",
         num_batches: int = 10,
+        # Local subprocess backend
+        proteinmpnn_env: str = "proteinmpnn",
+        proteinmpnn_path: str | None = None,
+        proteinmpnn_checkpoint: str | None = None,
+        backbone_noise: float = 0.0,
+        ensemble_n: int = 10,
+        decoding_order: str = "random",
     ) -> None:
         """
         Initialises SolMPNN Perplexity Energy.
@@ -1566,19 +1610,38 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         oracle : FoldingOracle
             The folding oracle (provides the predicted structure).
         residues : list[Residue] | list[list[Residue]] | None
-            Residues on the GEN chain to score.  When provided as a single
-            flat list or a list-of-lists with one group, defines the chain ID
-            used for MPNN scoring.  If ``None``, all residues are scored.
+            Residues on the chain to score.  Defines the chain ID.  If
+            ``None``, the first chain in the structure is scored.
         weight : float
             The weight of the energy term.
         name : str or None
             Optional name suffix.
-        modal_app_name : str
-            Name of the deployed Modal app that hosts the MPNN scorer.
-        modal_function_name : str
-            Name of the Modal function to call.
+        use_modal : bool
+            If True, route scoring through the deployed Modal app.  If False
+            (default), run locally via the ``proteinmpnn_env`` conda env.
+        modal_app_name, modal_function_name : str
+            Only used when ``use_modal=True``.
         num_batches : int
-            Number of random decoding orders to average over.
+            Only used when ``use_modal=True``.  Number of decoding orders
+            the Modal function averages over.
+        proteinmpnn_env : str
+            Name of the conda env that has torch + the ProteinMPNN repo
+            available (local mode only).
+        proteinmpnn_path : str | None
+            Path to the cloned ProteinMPNN repo.  Required when
+            ``use_modal=False``.
+        proteinmpnn_checkpoint : str | None
+            Optional path to a .pt weight file.  Defaults to
+            ``<proteinmpnn_path>/soluble_model_weights/v_48_020.pt``.
+        backbone_noise : float
+            Std-dev of Gaussian noise applied to backbone coords per pass.
+            (``augment_eps`` in ProteinMPNN.)
+        ensemble_n : int
+            Number of forward passes in the ensemble.  Each uses an
+            independent decoding order and an independent noise draw.
+        decoding_order : str
+            ``"random"`` (default) or ``"fixed:<seed>"`` for deterministic
+            ordering.
         """
         base_name = 'SolMPNN_perplexity'
         if name is not None:
@@ -1588,7 +1651,7 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             name=base_name, inheritable=False, oracle=oracle, weight=weight,
         )
 
-        # Store residue groups (single group — the GEN chain to score).
+        # Store residue groups (single group — the chain to score).
         if residues is not None:
             if isinstance(residues, list) and residues and isinstance(residues[0], list):
                 self.residue_groups = [residue_list_to_group(residues[0])]
@@ -1599,12 +1662,28 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             'Oracle must be an instance of FoldingOracle'
         )
 
+        self.use_modal = use_modal
         self.modal_app_name = modal_app_name
         self.modal_function_name = modal_function_name
         self.num_batches = num_batches
+        self.proteinmpnn_env = proteinmpnn_env
+        self.proteinmpnn_path = proteinmpnn_path
+        self.proteinmpnn_checkpoint = proteinmpnn_checkpoint
+        self.backbone_noise = backbone_noise
+        self.ensemble_n = ensemble_n
+        self.decoding_order = decoding_order
 
-    def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
-        import copy
+        if not self.use_modal and self.proteinmpnn_path is None:
+            raise ValueError(
+                'proteinmpnn_path must be set when use_modal=False. '
+                'Point it at a cloned https://github.com/dauparas/ProteinMPNN repo.'
+            )
+
+    def _prepare_pdb(self, oracles_result: 'OraclesResultDict') -> tuple[str, str]:
+        """Render the oracle structure to a PDB string and determine which
+        chain to score.  Returns (pdb_str, chain_id_to_score).
+        """
+        import copy as _copy
         import io
         import string
         from biotite.structure.io.pdb import PDBFile as BiotitePDBFile
@@ -1621,7 +1700,7 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         # PDB format only supports single-character chain IDs.  Boltz and
         # other predictors may produce multi-character IDs (e.g. "GEN").
         # Remap all chain IDs to single uppercase letters for PDB export,
-        # and track which letter the GEN chain maps to.
+        # and track which letter the chain maps to.
         unique_chains = list(pd.unique(structure.chain_id))
         needs_remap = any(len(cid) > 1 for cid in unique_chains)
 
@@ -1630,7 +1709,7 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             chain_map = {}
             for i, cid in enumerate(unique_chains):
                 chain_map[cid] = letters[i]
-            structure = copy.copy(structure)
+            structure = _copy.copy(structure)
             structure.chain_id = np.array(
                 [chain_map[cid] for cid in structure.chain_id],
                 dtype=structure.chain_id.dtype,
@@ -1639,14 +1718,57 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
         else:
             pdb_gen_chain = gen_chain_id
 
-        # Convert AtomArray → PDB string via biotite
         pdb_file = BiotitePDBFile()
         pdb_file.set_structure(structure)
         buf = io.StringIO()
         pdb_file.write(buf)
-        pdb_str = buf.getvalue()
+        return buf.getvalue(), pdb_gen_chain
 
-        # Call the Modal function (runs in an isolated container)
+    def _compute_local(self, pdb_str: str, pdb_gen_chain: str) -> float:
+        """Run the bundled proteinmpnn scoring script in a separate conda env."""
+        import json
+        import pathlib
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix='solmpnn_') as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            pdb_path = tmp / 'input.pdb'
+            out_path = tmp / 'result.json'
+            pdb_path.write_text(pdb_str)
+
+            # Resolve the bundled scorer script path (it lives in this package)
+            import os as _os
+            bagel_dir = _os.path.dirname(_os.path.abspath(__file__))
+            scorer_script = _os.path.join(bagel_dir, 'scripts', 'proteinmpnn_scorer.py')
+
+            cmd = [
+                'conda', 'run', '-n', self.proteinmpnn_env, 'python',
+                scorer_script,
+                '--pdb', str(pdb_path),
+                '--chains_to_score', pdb_gen_chain,
+                '--proteinmpnn_path', str(self.proteinmpnn_path),
+                '--backbone_noise', str(self.backbone_noise),
+                '--ensemble_n', str(self.ensemble_n),
+                '--decoding_order', self.decoding_order,
+                '--output_json', str(out_path),
+            ]
+            if self.proteinmpnn_checkpoint is not None:
+                cmd.extend(['--checkpoint', str(self.proteinmpnn_checkpoint)])
+
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f'proteinmpnn_scorer failed (exit {proc.returncode}): '
+                    f'{proc.stderr[-500:]}'
+                )
+
+            with open(out_path) as f:
+                result = json.load(f)
+            return float(result['perplexity'])
+
+    def _compute_modal(self, pdb_str: str, pdb_gen_chain: str) -> float:
+        """Legacy Modal backend."""
         import modal
         score_fn = modal.Function.from_name(
             self.modal_app_name, self.modal_function_name,
@@ -1656,7 +1778,15 @@ class SolMPNNPerplexityEnergy(EnergyTerm):
             chains_to_score=pdb_gen_chain,
             num_batches=self.num_batches,
         )
+        return float(result['perplexity'])
 
-        perplexity = result["perplexity"]
+    def compute(self, oracles_result: OraclesResultDict) -> tuple[float, float]:
+        pdb_str, pdb_gen_chain = self._prepare_pdb(oracles_result)
+
+        if self.use_modal:
+            perplexity = self._compute_modal(pdb_str, pdb_gen_chain)
+        else:
+            perplexity = self._compute_local(pdb_str, pdb_gen_chain)
+
         # Higher perplexity = worse designability = higher energy (no negation)
         return perplexity, perplexity * self.weight
